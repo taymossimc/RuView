@@ -28,9 +28,9 @@ pub use adapter::parse_macos_scan_output;
 pub use adapter::MacosCoreWlanScanner;
 
 #[cfg(target_os = "linux")]
-pub use adapter::parse_iw_scan_output;
+pub use adapter::{parse_iw_link_output, parse_iw_scan_output, pick_interface};
 #[cfg(target_os = "linux")]
-pub use adapter::LinuxIwScanner;
+pub use adapter::{LinuxIwScanner, LinuxWifiSampler};
 pub use domain::bssid::{BandType, BssidId, BssidObservation, RadioType};
 pub use domain::frame::MultiApFrame;
 pub use domain::registry::{BssidEntry, BssidMeta, BssidRegistry, RunningStats};

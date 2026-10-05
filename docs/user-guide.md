@@ -349,12 +349,43 @@ See [ADR-025](adr/ADR-025-macos-corewlan-wifi-sensing.md) for details.
 
 ### Linux WiFi (RSSI Only)
 
-Uses `iw dev <iface> scan` to capture RSSI. Requires `CAP_NET_ADMIN` (root) for active scans; use `scan dump` for cached results without root.
+Uses the `iw` tool (nl80211) on a managed-mode interface. The same multi-BSSID
+pipeline as Windows runs on top of it: the associated AP's RSSI is read every
+tick with `iw dev <iface> link`, and the surrounding APs are refreshed from the
+kernel scan cache (`iw dev <iface> scan dump`) after a periodic, non-blocking
+`iw dev <iface> scan trigger`. Nothing in the server ever blocks on a scan,
+because some vendor drivers (e.g. Realtek `rtl88x2ce`) never return from a
+blocking `iw scan`.
 
 ```bash
-# Run natively (requires root for active scanning)
-sudo ./target/release/sensing-server --source linux --http-port 3000 --ws-port 3001 --tick-ms 500
+# Run natively. `--source wifi` and `--source linux` are equivalent.
+./target/release/sensing-server --source wifi --http-port 3000 --ws-port 3001 --tick-ms 500
+
+# Docker (host network so the container sees the host's wlan interface;
+# NET_ADMIN is only needed for scan triggering)
+docker run --network host --cap-add NET_ADMIN -e RUVIEW_BIND_ADDR=127.0.0.1 \
+    ruvnet/wifi-densepose:latest --source wifi --tick-ms 500
 ```
+
+Environment variables:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RUVIEW_WIFI_IFACE` | auto (first associated managed iface from `iw dev`) | Wireless interface to sample |
+| `RUVIEW_WIFI_SCAN_INTERVAL_MS` | `15000` | How often to issue `scan trigger`; `0` disables triggering |
+
+Permissions:
+
+- `iw dev <iface> link` and `iw dev <iface> scan dump` work unprivileged, so
+  without `CAP_NET_ADMIN` the server degrades to the associated AP plus whatever
+  the kernel (or NetworkManager's own periodic scans) has cached.
+- `iw dev <iface> scan trigger` needs `CAP_NET_ADMIN`. Without it the server logs
+  one warning and stops trying.
+- Interfaces managed by NetworkManager keep working; scanning briefly interrupts
+  traffic on the associated link, which is why the interval defaults to 15 s.
+
+Like the Windows and macOS sources this is RSSI only: presence and coarse motion
+classification, no CSI, no pose.
 
 ### ESP32-S3 (Full CSI)
 

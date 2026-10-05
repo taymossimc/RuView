@@ -12,16 +12,28 @@
 //!
 //! # Permissions
 //!
-//! - `iw dev <iface> scan` requires `CAP_NET_ADMIN` (typically root).
-//! - `iw dev <iface> scan dump` reads cached results and may work without root
-//!   on some distributions.
+//! - `iw dev <iface> scan` / `scan trigger` require `CAP_NET_ADMIN` (typically root).
+//! - `iw dev <iface> scan dump` reads cached results and works without root.
+//! - `iw dev <iface> link` (associated-AP RSSI) works without root.
+//!
+//! # Sampling model ([`LinuxWifiSampler`])
+//!
+//! A blocking `iw dev <iface> scan` can take seconds and, on some vendor drivers
+//! (e.g. Realtek `rtl88x2ce`), never returns while the interface is associated.
+//! The sampler therefore never blocks on a scan: it reads the associated AP's
+//! RSSI from `iw link` on every tick (milliseconds), and refreshes the
+//! multi-BSSID table from `scan dump` on each tick, requesting a fresh scan with
+//! `scan trigger` every `scan_interval`. Without `CAP_NET_ADMIN` the trigger is
+//! skipped and the table only refreshes when something else (NetworkManager,
+//! wpa_supplicant) scans; the associated AP stays live either way.
 //!
 //! # Platform
 //!
 //! Linux only. Gated behind `#[cfg(target_os = "linux")]` at the module level.
 
+use std::collections::HashMap;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::domain::bssid::{BandType, BssidId, BssidObservation, RadioType};
 use crate::error::WifiScanError;
@@ -66,37 +78,234 @@ impl LinuxIwScanner {
         self
     }
 
+    /// Create a scanner for the first managed wireless interface reported by
+    /// `iw dev` (preferring one that is currently associated). Falls back to
+    /// `wlan0` when `iw dev` is unavailable or lists nothing.
+    pub fn auto_detect() -> Self {
+        let iface = detect_interface().unwrap_or_else(|| "wlan0".to_owned());
+        Self::with_interface(iface)
+    }
+
+    /// The wireless interface this scanner operates on.
+    pub fn interface(&self) -> &str {
+        &self.interface
+    }
+
     /// Run `iw dev <iface> scan` and parse the output synchronously.
     ///
     /// Returns one [`BssidObservation`] per BSS stanza in the output.
     pub fn scan_sync(&self) -> Result<Vec<BssidObservation>, WifiScanError> {
-        let scan_cmd = if self.use_dump { "dump" } else { "scan" };
-
-        let mut args = vec!["dev", &self.interface, "scan"];
-        if self.use_dump {
-            args.push(scan_cmd);
-        }
-
         // iw uses "scan dump" not "scan scan dump"
         let args = if self.use_dump {
             vec!["dev", &self.interface, "scan", "dump"]
         } else {
             vec!["dev", &self.interface, "scan"]
         };
+        let stdout = run_iw(&args)?;
+        parse_iw_scan_output(&stdout)
+    }
 
-        let output = Command::new("iw").args(&args).output().map_err(|e| {
-            WifiScanError::ProcessError(format!("failed to run `iw {}`: {e}", args.join(" ")))
-        })?;
+    /// Ask the driver to start a scan without waiting for it (`iw ... scan trigger`).
+    ///
+    /// Needs `CAP_NET_ADMIN`. A driver that is already scanning answers
+    /// `EBUSY`, which is reported as [`WifiScanError::ScanFailed`] like any
+    /// other failure; callers that only want "best effort" can ignore the error.
+    pub fn trigger_scan(&self) -> Result<(), WifiScanError> {
+        run_iw(&["dev", &self.interface, "scan", "trigger"]).map(|_| ())
+    }
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(WifiScanError::ScanFailed {
-                reason: format!("iw exited with {}: {}", output.status, stderr.trim()),
-            });
+    /// Read the associated AP's RSSI from `iw dev <iface> link` (no privilege needed).
+    ///
+    /// Returns `Ok(None)` when the interface is not associated.
+    pub fn link_sync(&self) -> Result<Option<BssidObservation>, WifiScanError> {
+        let stdout = run_iw(&["dev", &self.interface, "link"])?;
+        Ok(parse_iw_link_output(&stdout))
+    }
+}
+
+fn run_iw(args: &[&str]) -> Result<String, WifiScanError> {
+    let output = Command::new("iw").args(args).output().map_err(|e| {
+        WifiScanError::ProcessError(format!("failed to run `iw {}`: {e}", args.join(" ")))
+    })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(WifiScanError::ScanFailed {
+            reason: format!("iw {} exited with {}: {}", args.join(" "), output.status, stderr.trim()),
+        });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// Pick a wireless interface from `iw dev` output: the first managed interface
+/// that is associated (has an `ssid` line), else the first managed interface.
+fn detect_interface() -> Option<String> {
+    let out = run_iw(&["dev"]).ok()?;
+    pick_interface(&out)
+}
+
+/// Pure parser behind [`detect_interface`].
+pub fn pick_interface(iw_dev_output: &str) -> Option<String> {
+    let mut first_managed: Option<String> = None;
+    let mut current: Option<(String, bool, bool)> = None; // (name, managed, associated)
+
+    let flush = |cur: &mut Option<(String, bool, bool)>, first: &mut Option<String>| -> Option<String> {
+        if let Some((name, managed, associated)) = cur.take() {
+            if managed {
+                if associated {
+                    return Some(name);
+                }
+                first.get_or_insert(name);
+            }
+        }
+        None
+    };
+
+    for line in iw_dev_output.lines() {
+        let t = line.trim();
+        if let Some(name) = t.strip_prefix("Interface ") {
+            if let Some(found) = flush(&mut current, &mut first_managed) {
+                return Some(found);
+            }
+            current = Some((name.trim().to_owned(), false, false));
+        } else if let Some(cur) = current.as_mut() {
+            if let Some(ty) = t.strip_prefix("type ") {
+                cur.1 = ty.trim() == "managed";
+            } else if t.starts_with("ssid ") {
+                cur.2 = true;
+            }
+        }
+    }
+    if let Some(found) = flush(&mut current, &mut first_managed) {
+        return Some(found);
+    }
+    first_managed
+}
+
+/// Parse `iw dev <iface> link` output into a single observation of the associated AP.
+///
+/// ```text
+/// Connected to 36:5d:9e:f0:87:64 (on wlP1p1s0)
+///         SSID: Moss
+///         freq: 5785
+///         signal: -47 dBm
+/// ```
+/// Returns `None` for `Not connected.` or unparseable output.
+pub fn parse_iw_link_output(output: &str) -> Option<BssidObservation> {
+    let mut stanza = BssStanza::default();
+    for line in output.lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Connected to ") {
+            let mac = rest.split_whitespace().next()?;
+            if mac.len() == 17 {
+                stanza.bssid = Some(mac.to_lowercase());
+            }
+        } else if let Some(rest) = t.strip_prefix("SSID:") {
+            stanza.ssid = Some(rest.trim().to_owned());
+        } else if let Some(rest) = t.strip_prefix("freq:") {
+            stanza.freq_mhz = parse_freq_mhz(rest);
+        } else if let Some(rest) = t.strip_prefix("signal:") {
+            stanza.signal_dbm = parse_signal_dbm(rest);
+        }
+    }
+    stanza.bssid.as_ref()?;
+    stanza.signal_dbm?;
+    stanza.flush(Instant::now())
+}
+
+// ---------------------------------------------------------------------------
+// LinuxWifiSampler
+// ---------------------------------------------------------------------------
+
+/// Stateful, non-blocking multi-BSSID sampler for Linux (see module docs).
+pub struct LinuxWifiSampler {
+    scanner: LinuxIwScanner,
+    scan_interval: Duration,
+    last_trigger: Option<Instant>,
+    /// Whether `scan trigger` is believed to work (cleared on EPERM so we stop
+    /// spawning a failing process every interval).
+    can_trigger: bool,
+    /// Last-known observation per BSSID from `scan dump`.
+    table: HashMap<BssidId, BssidObservation>,
+}
+
+impl LinuxWifiSampler {
+    /// Create a sampler on `iface`; `scan_interval` of zero disables scan
+    /// triggering (link-only plus whatever the kernel cache already holds).
+    pub fn new(iface: impl Into<String>, scan_interval: Duration) -> Self {
+        Self {
+            scanner: LinuxIwScanner::with_interface(iface),
+            scan_interval,
+            last_trigger: None,
+            can_trigger: !scan_interval.is_zero(),
+            table: HashMap::new(),
+        }
+    }
+
+    /// The wireless interface being sampled.
+    pub fn interface(&self) -> &str {
+        self.scanner.interface()
+    }
+
+    /// Whether scan triggering is still enabled (it is disabled permanently
+    /// after the first permission failure).
+    pub fn scanning_enabled(&self) -> bool {
+        self.can_trigger
+    }
+
+    /// One tick: returns the current BSSID observations, associated AP first
+    /// with a fresh RSSI, then the other cached BSSIDs ordered by RSSI.
+    ///
+    /// Errors only when the interface cannot be queried at all.
+    pub fn sample(&mut self) -> Result<Vec<BssidObservation>, WifiScanError> {
+        let link = self.scanner.link_sync()?;
+
+        if self.can_trigger
+            && self
+                .last_trigger
+                .is_none_or(|t| t.elapsed() >= self.scan_interval)
+        {
+            match self.scanner.trigger_scan() {
+                Ok(()) => {}
+                Err(WifiScanError::ScanFailed { reason }) if reason.contains("Operation not permitted") => {
+                    tracing::warn!(
+                        "iw scan trigger not permitted on {} (needs CAP_NET_ADMIN); \
+                         continuing with associated-AP RSSI plus cached scan results",
+                        self.scanner.interface()
+                    );
+                    self.can_trigger = false;
+                }
+                Err(e) => tracing::debug!("iw scan trigger: {e}"), // EBUSY etc.
+            }
+            self.last_trigger = Some(Instant::now());
         }
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        parse_iw_scan_output(&stdout)
+        if let Ok(dump) = self.scanner.clone_cached().scan_sync() {
+            for obs in dump {
+                self.table.insert(obs.bssid, obs);
+            }
+        }
+
+        let mut out: Vec<BssidObservation> = Vec::with_capacity(self.table.len() + 1);
+        if let Some(link) = link {
+            // live RSSI for the associated AP replaces the cached entry
+            self.table.remove(&link.bssid);
+            out.push(link);
+        }
+        let mut rest: Vec<BssidObservation> = self.table.values().cloned().collect();
+        rest.sort_by(|a, b| b.rssi_dbm.total_cmp(&a.rssi_dbm));
+        out.extend(rest);
+        Ok(out)
+    }
+}
+
+impl LinuxIwScanner {
+    fn clone_cached(&self) -> Self {
+        Self {
+            interface: self.interface.clone(),
+            use_dump: true,
+        }
     }
 }
 
@@ -197,8 +406,8 @@ pub fn parse_iw_scan_output(output: &str) -> Result<Vec<BssidObservation>, WifiS
                 // "signal: -52.00 dBm"
                 stanza.signal_dbm = parse_signal_dbm(rest);
             } else if let Some(rest) = trimmed.strip_prefix("freq:") {
-                // "freq: 5180"
-                stanza.freq_mhz = rest.trim().parse().ok();
+                // "freq: 5180" (iw <= 5.x) or "freq: 5180.0" (iw >= 6.x prints kHz precision)
+                stanza.freq_mhz = parse_freq_mhz(rest);
             } else if let Some(rest) = trimmed.strip_prefix("DS Parameter set: channel") {
                 // "DS Parameter set: channel 6"
                 stanza.channel = rest.trim().parse().ok();
@@ -227,6 +436,19 @@ fn freq_to_channel(freq_mhz: u32) -> u8 {
         // 6 GHz (Wi-Fi 6E).       Max result (7115-5950)/5 = 233 — fits u8.
         5955..=7115 => u8::try_from((freq_mhz - 5950) / 5).unwrap_or(0),
         _ => 0,
+    }
+}
+
+/// Parse a frequency field like "5180", "5180.0" or "5180 MHz" into whole MHz.
+fn parse_freq_mhz(s: &str) -> Option<u32> {
+    let num = s.split_whitespace().next()?;
+    let f: f64 = num.parse().ok()?;
+    // Range-checked above u32 precision concerns: 0 < f < 1e6 so the cast is exact.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    if f.is_finite() && f > 0.0 && f < 1.0e6 {
+        Some(f.round() as u32)
+    } else {
+        None
     }
 }
 
@@ -335,6 +557,79 @@ BSS 11:22:33:44:55:66(on wlan0)
         let obs = parse_iw_scan_output(output).unwrap();
         assert_eq!(obs.len(), 1);
         assert_eq!(obs[0].ssid, "");
+    }
+
+    /// iw 6.x (and vendor drivers such as rtl88x2ce) print `freq: 5785.0`.
+    #[test]
+    fn fractional_freq_is_parsed() {
+        let output = "\
+BSS 36:5d:9e:f0:87:64(on wlP1p1s0) -- associated
+\tfreq: 5785.0
+\tsignal: -43.00 dBm
+\tSSID: Moss
+BSS d8:44:89:df:4a:a0(on wlP1p1s0)
+\tfreq: 2412.0
+\tsignal: -29.00 dBm
+\tSSID: Moss3
+";
+        let obs = parse_iw_scan_output(output).unwrap();
+        assert_eq!(obs.len(), 2);
+        assert_eq!(obs[0].channel, 157);
+        assert_eq!(obs[0].band, BandType::Band5GHz);
+        assert_eq!(obs[1].channel, 1);
+        assert_eq!(obs[1].band, BandType::Band2_4GHz);
+        assert_eq!(parse_freq_mhz(" 2437 MHz"), Some(2437));
+        assert_eq!(parse_freq_mhz("garbage"), None);
+    }
+
+    #[test]
+    fn parse_link_output_connected() {
+        let output = "\
+Connected to 36:5d:9e:f0:87:64 (on wlP1p1s0)
+\tSSID: Moss
+\tfreq: 5785
+\tRX: 123456 bytes (789 packets)
+\tTX: 2345 bytes (67 packets)
+\tsignal: -47 dBm
+\trx bitrate: 390.0 MBit/s VHT-MCS 9 80MHz short GI VHT-NSS 1
+";
+        let obs = parse_iw_link_output(output).expect("associated");
+        assert_eq!(obs.bssid.to_string(), "36:5d:9e:f0:87:64");
+        assert_eq!(obs.ssid, "Moss");
+        assert_eq!(obs.channel, 157);
+        assert!((obs.rssi_dbm - (-47.0)).abs() < f64::EPSILON);
+        // (-47 + 100) * 2 = 106 → clamped to 100
+        assert!((obs.signal_pct - 100.0).abs() < 1e-9, "signal_pct={}", obs.signal_pct);
+    }
+
+    #[test]
+    fn parse_link_output_not_connected() {
+        assert!(parse_iw_link_output("Not connected.\n").is_none());
+        assert!(parse_iw_link_output("").is_none());
+    }
+
+    #[test]
+    fn pick_interface_prefers_associated_managed() {
+        let output = "\
+phy#1
+\tInterface wlan1
+\t\tifindex 5
+\t\ttype managed
+phy#0
+\tInterface p2p-dev-wlP1p1s0
+\t\ttype P2P-device
+\tInterface wlP1p1s0
+\t\tifindex 3
+\t\taddr 48:8f:4c:d5:eb:40
+\t\tssid Moss
+\t\ttype managed
+\t\tchannel 157 (5785 MHz), width: 80 MHz, center1: 5775 MHz
+";
+        assert_eq!(pick_interface(output).as_deref(), Some("wlP1p1s0"));
+        // No associated interface: first managed one wins.
+        let output2 = "phy#0\n\tInterface wlan0\n\t\ttype managed\n\tInterface mon0\n\t\ttype monitor\n";
+        assert_eq!(pick_interface(output2).as_deref(), Some("wlan0"));
+        assert_eq!(pick_interface(""), None);
     }
 
     #[test]

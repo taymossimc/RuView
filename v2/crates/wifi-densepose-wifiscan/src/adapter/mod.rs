@@ -29,6 +29,6 @@ pub use macos_scanner::parse_macos_scan_output;
 pub use macos_scanner::MacosCoreWlanScanner;
 
 #[cfg(target_os = "linux")]
-pub use linux_scanner::parse_iw_scan_output;
+pub use linux_scanner::{parse_iw_link_output, parse_iw_scan_output, pick_interface};
 #[cfg(target_os = "linux")]
-pub use linux_scanner::LinuxIwScanner;
+pub use linux_scanner::{LinuxIwScanner, LinuxWifiSampler};

@@ -83,7 +83,7 @@ use rvf_pipeline::ProgressiveLoader;
 use vital_signs::{VitalSignDetector, VitalSigns};
 
 // ADR-022 Phase 3: Multi-BSSID pipeline integration
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 use wifi_densepose_wifiscan::parse_netsh_output as parse_netsh_bssid_output;
 use wifi_densepose_wifiscan::{BssidRegistry, WindowsWifiPipeline};
 
@@ -4232,6 +4232,35 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
         tick_ms
     );
 
+    // Linux: `iw link` every tick for the associated AP, `scan trigger`/`scan dump`
+    // every RUVIEW_WIFI_SCAN_INTERVAL_MS (default 15 s, 0 = never trigger) for the
+    // multi-BSSID table. Never blocks on a scan (vendor drivers can hang there).
+    #[cfg(target_os = "linux")]
+    let sampler = {
+        let iface = std::env::var("RUVIEW_WIFI_IFACE")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| {
+                wifi_densepose_wifiscan::LinuxIwScanner::auto_detect()
+                    .interface()
+                    .to_owned()
+            });
+        let scan_interval_ms: u64 = std::env::var("RUVIEW_WIFI_SCAN_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(15_000);
+        info!(
+            "Linux WiFi source: iface={iface}, scan trigger every {scan_interval_ms} ms \
+             (RSSI-only: presence/motion, no CSI)"
+        );
+        std::sync::Arc::new(std::sync::Mutex::new(
+            wifi_densepose_wifiscan::LinuxWifiSampler::new(
+                iface,
+                Duration::from_millis(scan_interval_ms),
+            ),
+        ))
+    };
+
     loop {
         interval.tick().await;
         seq += 1;
@@ -4246,7 +4275,17 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
         })
         .await;
 
-        #[cfg(not(target_os = "macos"))]
+        #[cfg(target_os = "linux")]
+        let bssid_scan_result = {
+            let sampler = sampler.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut s = sampler.lock().map_err(|e| e.to_string())?;
+                s.sample().map_err(|e| e.to_string())
+            })
+            .await
+        };
+
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         let bssid_scan_result = tokio::task::spawn_blocking(|| {
             let output = std::process::Command::new("netsh")
                 .args(["wlan", "show", "networks", "mode=bssid"])
@@ -4273,13 +4312,13 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
             Ok(Ok(_empty)) => {
                 debug!("WiFi scan returned 0 observations");
                 #[cfg(not(target_os = "macos"))]
-                windows_wifi_fallback_tick(&state, seq).await;
+                single_rssi_fallback_tick(&state, seq).await;
                 continue;
             }
             Ok(Err(e)) => {
                 warn!("WiFi scan error: {e}");
                 #[cfg(not(target_os = "macos"))]
-                windows_wifi_fallback_tick(&state, seq).await;
+                single_rssi_fallback_tick(&state, seq).await;
                 continue;
             }
             Err(join_err) => {
@@ -4307,12 +4346,20 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
         let first_rssi = observations.first().map(|o| o.rssi_dbm).unwrap_or(-80.0);
         let _first_signal_pct = observations.first().map(|o| o.signal_pct).unwrap_or(40.0);
 
+        // Centre frequency of the strongest/associated BSSID (fall back to ch 6).
+        let first_freq_mhz: u16 = observations
+            .first()
+            .map(|o| channel_to_freq_mhz(o.channel))
+            .filter(|f| *f > 0)
+            .and_then(|f| u16::try_from(f).ok())
+            .unwrap_or(2437);
+
         let frame = Esp32Frame {
             magic: 0xC511_0001,
             node_id: 0,
             n_antennas: 1,
             n_subcarriers: obs_count.min(u16::MAX as usize) as u16,
-            freq_mhz: 2437,
+            freq_mhz: first_freq_mhz,
             sequence: seq,
             rssi: first_rssi.clamp(-128.0, 127.0) as i8,
             noise_floor: -90,
@@ -4473,11 +4520,41 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
     }
 }
 
-/// Fallback: single-RSSI collection via `netsh wlan show interfaces`.
-///
-/// Used when the multi-BSSID scan fails or returns 0 observations.
-#[cfg(not(target_os = "macos"))]
-async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
+/// 802.11 channel number → centre frequency in MHz (0 if unknown).
+fn channel_to_freq_mhz(channel: u8) -> u32 {
+    match channel {
+        1..=13 => 2407 + 5 * u32::from(channel),
+        14 => 2484,
+        32..=177 => 5000 + 5 * u32::from(channel),
+        _ => 0,
+    }
+}
+
+/// Fetch the associated interface's RSSI for the single-RSSI fallback:
+/// `netsh wlan show interfaces` on Windows, `iw dev <iface> link` on Linux.
+#[cfg(target_os = "linux")]
+async fn fetch_single_rssi() -> Option<(f64, f64, String)> {
+    let iface = std::env::var("RUVIEW_WIFI_IFACE")
+        .ok()
+        .filter(|s| !s.is_empty());
+    tokio::task::spawn_blocking(move || {
+        let scanner = match iface {
+            Some(i) => wifi_densepose_wifiscan::LinuxIwScanner::with_interface(i),
+            None => wifi_densepose_wifiscan::LinuxIwScanner::auto_detect(),
+        };
+        scanner
+            .link_sync()
+            .ok()
+            .flatten()
+            .map(|o| (o.rssi_dbm, o.signal_pct, o.ssid))
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+async fn fetch_single_rssi() -> Option<(f64, f64, String)> {
     let output = match tokio::process::Command::new("netsh")
         .args(["wlan", "show", "interfaces"])
         .output()
@@ -4486,11 +4563,18 @@ async fn windows_wifi_fallback_tick(state: &SharedState, seq: u32) {
         Ok(o) => String::from_utf8_lossy(&o.stdout).to_string(),
         Err(e) => {
             warn!("netsh interfaces fallback failed: {e}");
-            return;
+            return None;
         }
     };
+    parse_netsh_interfaces_output(&output)
+}
 
-    let (rssi_dbm, signal_pct, ssid) = match parse_netsh_interfaces_output(&output) {
+/// Fallback: single-RSSI collection from the associated interface.
+///
+/// Used when the multi-BSSID scan fails or returns 0 observations.
+#[cfg(not(target_os = "macos"))]
+async fn single_rssi_fallback_tick(state: &SharedState, seq: u32) {
+    let (rssi_dbm, signal_pct, ssid) = match fetch_single_rssi().await {
         Some(v) => v,
         None => {
             debug!("Fallback: no WiFi interface connected");
@@ -4641,8 +4725,14 @@ async fn probe_wifi() -> bool {
     )
 }
 
+/// Probe if a Linux wireless interface is associated (`iw dev <iface> link`).
+#[cfg(target_os = "linux")]
+async fn probe_wifi() -> bool {
+    fetch_single_rssi().await.is_some()
+}
+
 /// Probe if Windows WiFi is connected.
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 async fn probe_wifi() -> bool {
     match tokio::process::Command::new("netsh")
         .args(["wlan", "show", "interfaces"])
@@ -4758,7 +4848,9 @@ fn plan_source(requested: &str, esp32_detected: bool, wifi_detected: bool) -> So
             run_simulator: false,
             run_wifi: false,
         },
-        "wifi" => SourcePlan {
+        // "linux" / "macos" / "windows" are documented aliases: the host WiFi
+        // adapter is selected by target_os at compile time, not by this flag.
+        "wifi" | "linux" | "macos" | "windows" => SourcePlan {
             initial_source: "wifi".to_string(),
             bind_udp: false,
             run_simulator: false,

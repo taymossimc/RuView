@@ -17,7 +17,9 @@
 #                                 the server no longer silently falls back to
 #                                 synthetic data — that's now opt-in only).
 #                    esp32      — listen for UDP CSI on the configured port.
-#                    wifi       — Windows-native WiFi capture.
+#                    wifi       — host WiFi RSSI capture (Windows netsh, macOS
+#                                 CoreWLAN, Linux iw — Linux needs --network host
+#                                 and, for scan triggering, --cap-add NET_ADMIN).
 #                    simulated  — explicit demo mode with synthetic CSI.
 #                  Default is `auto`. Set CSI_SOURCE=simulated when you want
 #                  fake data tagged as such; never set it implicitly.

@@ -42,8 +42,10 @@ RUN cargo build --release -p wifi-densepose-sensing-server --features "${SENSING
 # Stage 2: Runtime
 FROM debian:bookworm-slim
 
+# `iw` is what `--source wifi` shells out to on Linux (host-network container).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
+    iw \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -91,7 +93,7 @@ ENV RUST_LOG=info
 # CSI_SOURCE controls which data source the sensing server uses at startup.
 # auto      — probe UDP port 5005 for an ESP32 first; fall back to simulation (default)
 # esp32     — receive real CSI frames from an ESP32 device over UDP port 5005
-# wifi      — use host Wi-Fi RSSI/scan data (Windows netsh; not available in containers)
+# wifi      — use host Wi-Fi RSSI/scan data (Linux iw with --network host; Windows netsh natively)
 # simulated — generate synthetic CSI frames (no hardware required)
 # Override at runtime:  docker run -e CSI_SOURCE=esp32 ...
 ENV CSI_SOURCE=auto
