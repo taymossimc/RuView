@@ -2121,6 +2121,23 @@ mod adr323_pose_physics_http_tests {
 /// If no ESP32 frame arrives within this duration, source reverts to offline.
 const ESP32_OFFLINE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Provenance label for CSI frames arriving on the UDP :5005 data plane.
+/// Defaults to `esp32` (the firmware that defined ADR-018). Any other ADR-018
+/// producer (an SDR bridge, a NIC CSI tool) sets `RUVIEW_UDP_SOURCE_LABEL` so
+/// `/api/v1/status`, the WebSocket `source` field and the UI banner name the
+/// real hardware instead of claiming an ESP32. Labels are free-form but must
+/// not be one of the synthetic names (`simulated`, `synthetic`, `test`).
+fn udp_source_label() -> &'static str {
+    static LABEL: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LABEL.get_or_init(|| {
+        std::env::var("RUVIEW_UDP_SOURCE_LABEL")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty() && !v.contains(':') && v.len() <= 32)
+            .unwrap_or_else(|| "esp32".to_string())
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CalibrationSequenceOrder {
     First,
@@ -2488,7 +2505,7 @@ impl AppStateInner {
     }
 
     fn effective_source(&self) -> String {
-        if self.source == "esp32" {
+        if self.source == udp_source_label() {
             if let Some(last) = self.last_esp32_frame {
                 if last.elapsed() > ESP32_OFFLINE_TIMEOUT {
                     return "esp32:offline".to_string();
@@ -4811,7 +4828,7 @@ fn plan_source(requested: &str, esp32_detected: bool, wifi_detected: bool) -> So
             if esp32_detected {
                 // Real CSI already flowing — bind UDP, no simulator.
                 SourcePlan {
-                    initial_source: "esp32".to_string(),
+                    initial_source: udp_source_label().to_string(),
                     bind_udp: true,
                     run_simulator: false,
                     run_wifi: false,
@@ -4843,7 +4860,7 @@ fn plan_source(requested: &str, esp32_detected: bool, wifi_detected: bool) -> So
             run_wifi: false,
         },
         "esp32" => SourcePlan {
-            initial_source: "esp32".to_string(),
+            initial_source: udp_source_label().to_string(),
             bind_udp: true,
             run_simulator: false,
             run_wifi: false,
@@ -5318,7 +5335,7 @@ fn primary_source_with_realtek(
     realtek_source: &str,
 ) -> String {
     if last_esp32_frame.is_some_and(|seen| seen.elapsed() < ESP32_OFFLINE_TIMEOUT) {
-        "esp32".to_string()
+        udp_source_label().to_string()
     } else {
         realtek_source.to_string()
     }
@@ -10049,7 +10066,7 @@ async fn udp_receiver_task(
                     // detections for ESP32 nodes running the edge DSP pipeline
                     // (Tier 2+).  Without this, vitals arrive but the UI shows
                     // "no detection" because it only renders sensing_update msgs.
-                    s.source = "esp32".to_string();
+                    s.source = udp_source_label().to_string();
                     s.last_esp32_frame = Some(std::time::Instant::now());
 
                     // ── Per-node state for edge vitals (issue #249) ──────
@@ -10235,7 +10252,7 @@ async fn udp_receiver_task(
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-                        source: "esp32".to_string(),
+                        source: udp_source_label().to_string(),
                         tick,
                         nodes: active_nodes,
                         features: fused_features.clone(),
@@ -10389,7 +10406,7 @@ async fn udp_receiver_task(
                     );
 
                     let mut s = state.write().await;
-                    s.source = "esp32".to_string();
+                    s.source = udp_source_label().to_string();
                     let observed_at = std::time::Instant::now();
                     s.last_esp32_frame = Some(observed_at);
                     let grid_key = CsiGridKey::from_frame(&frame);
@@ -10709,7 +10726,7 @@ async fn udp_receiver_task(
                     let mut update = SensingUpdate {
                         msg_type: "sensing_update".to_string(),
                         timestamp: chrono::Utc::now().timestamp_millis() as f64 / 1000.0,
-                        source: "esp32".to_string(),
+                        source: udp_source_label().to_string(),
                         tick,
                         nodes: active_nodes,
                         features: fused_features.clone(),

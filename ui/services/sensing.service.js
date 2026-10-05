@@ -470,6 +470,23 @@ class SensingService {
     return this._serverSource;
   }
 
+  /**
+   * Human name for the live hardware behind the server's `source` label.
+   * "esp32" → "ESP32 HARDWARE"; "wifi:<ssid>" → "WIFI RSSI (<ssid>)";
+   * "sdr_pluto" / "sdr-pluto" → "SDR CSI (PLUTO)"; anything else is shown
+   * verbatim in upper case rather than being mislabelled as an ESP32.
+   */
+  get liveSourceName() {
+    const raw = String(this._serverSource || '');
+    if (!raw || raw === 'esp32' || raw === 'live') return 'ESP32 HARDWARE';
+    if (raw.startsWith('wifi')) {
+      return 'WIFI RSSI' + (raw.includes(':') ? ' (' + raw.slice(raw.indexOf(':') + 1) + ')' : '');
+    }
+    const m = raw.match(/^sdr[_-](.+)$/i);
+    if (m) return 'SDR CSI (' + m[1].toUpperCase() + ')';
+    return raw.toUpperCase();
+  }
+
   // ---- Data handling -----------------------------------------------------
 
   _handleData(data) {

@@ -225,11 +225,8 @@ export class SensingTab {
       // Map the service's dataSource to banner text and CSS modifier class.
       const dataSource = sensingService.dataSource;
       // "live" covers every real source; name it from the server's source
-      // string ("esp32", "wifi:<ssid>" for Windows/macOS/Linux RSSI, ...).
-      const raw = String(sensingService.serverSource || '');
-      const liveText = raw.startsWith('wifi')
-        ? 'LIVE \u2014 WIFI RSSI' + (raw.includes(':') ? ' (' + raw.slice(raw.indexOf(':') + 1) + ')' : '')
-        : 'LIVE \u2014 ESP32 HARDWARE';
+      // string ("esp32", "wifi:<ssid>", "sdr_pluto", ...).
+      const liveText = 'LIVE \u2014 ' + sensingService.liveSourceName;
       const bannerConfig = {
         'live':              { text: liveText,                             cls: 'sensing-source-live' },
         'server-simulated':  { text: 'SIMULATED \u2014 NO HARDWARE',        cls: 'sensing-source-server-sim' },
