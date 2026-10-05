@@ -36,6 +36,8 @@ const MAX_RECONNECT_ATTEMPTS = 20;
 // This prevents the UI from flashing "SIMULATED" on a brief hiccup.
 const SIM_FALLBACK_AFTER_ATTEMPTS = 5;
 const SIMULATION_INTERVAL = 500; // ms
+// Minimum spacing between /api/v1/status re-probes after a failed probe.
+const STATUS_REPROBE_INTERVAL_MS = 5000;
 
 export const SIM_FALLBACK_STORAGE_KEY = 'ruview-client-simulation';
 
@@ -424,17 +426,35 @@ class SensingService {
     // actually succeed under the documented secure posture (API auth
     // enabled) instead of always 401ing and relying solely on the
     // conservative fallback below (issue #1526, suggested fix #1).
+    this._lastStatusProbeAt = Date.now();
     try {
       const resp = await fetch('/api/v1/status', { headers: apiService.getHeaders() });
       if (resp.ok) {
         const json = await resp.json();
         this._applyServerSource(json.source, json.source_state);
+        this._statusProbeFailed = false;
       } else {
+        this._statusProbeFailed = true;
         this._setDataSource('server-simulated');
       }
     } catch {
+      this._statusProbeFailed = true;
       this._setDataSource('server-simulated');
     }
+  }
+
+  /**
+   * A probe that failed (server still starting after a restart, transient
+   * network error) must not pin "server-simulated" for the rest of the
+   * session while live frames keep arriving: `_handleData` only re-evaluates
+   * the source when the raw label changes, and it does not. Re-probe at most
+   * every few seconds while the displayed provenance is derived from a
+   * failed probe rather than from the server's own `source_state`.
+   */
+  _maybeReprobeStatus() {
+    if (!this._statusProbeFailed || this._state !== 'connected') return;
+    if (Date.now() - (this._lastStatusProbeAt || 0) < STATUS_REPROBE_INTERVAL_MS) return;
+    void this._detectServerSource();
   }
 
   /**
@@ -455,7 +475,11 @@ class SensingService {
       }
       return;
     }
-    if (rawSource === 'esp32' || rawSource === 'wifi' || rawSource === 'live') {
+    const raw = String(rawSource || '');
+    // Hardware labels: ESP32 UDP, the Linux/Windows WiFi scan source
+    // ("wifi" or "wifi:<ssid>") and SDR CSI bridges ("sdr_<radio>", set via
+    // RUVIEW_UDP_SOURCE_LABEL) are all real captures.
+    if (raw === 'esp32' || raw === 'live' || raw.startsWith('wifi') || /^sdr[_-]/i.test(raw)) {
       this._setDataSource('live');
     } else if (rawSource === 'simulated' || rawSource === 'simulate') {
       this._setDataSource('server-simulated');
@@ -498,6 +522,8 @@ class SensingService {
       const raw = data.source;
       if (raw !== this._serverSource) {
         this._applyServerSource(raw);
+      } else {
+        this._maybeReprobeStatus();
       }
     }
 
