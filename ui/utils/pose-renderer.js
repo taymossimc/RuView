@@ -131,6 +131,19 @@ export class PoseRenderer {
       
       console.log(`👥 [RENDERER] Found ${poseData.persons.length} persons to render`);
 
+      // Without a trained model the server's "signal_derived" persons are a
+      // procedurally animated figure driven by three scalars (motion power,
+      // breathing power, confidence), not an estimate of anybody's body.
+      // Drawing it as a skeleton presents invented limbs as measurement, so
+      // show the measured quantities instead.
+      if (poseData.pose_source === 'signal_derived') {
+        // The debug box is skipped here: it would overprint the node table
+        // and the stats overlay already carries frame/FPS counters.
+        this.renderMeasuredMode(poseData, metadata);
+        this.updatePerformanceMetrics(startTime);
+        return;
+      }
+
       // Render based on mode
       switch (this.config.mode) {
         case 'skeleton':
@@ -544,6 +557,126 @@ export class PoseRenderer {
     );
     this.ctx.textAlign = 'left';
     this.ctx.font = `${this.config.fontSize}px Arial`;
+  }
+
+  // Measured-quantities view used when no pose model is loaded.
+  // Draws the fused classification and, per CSI node, the server's own
+  // per-node motion level and motion-band power. Everything drawn here is a
+  // number the server reported; nothing is interpolated into a body.
+  renderMeasuredMode(poseData, metadata) {
+    const ctx = this.ctx;
+    const W = this.canvas.width;
+    const H = this.canvas.height;
+    const sensing = metadata.sensing || null;
+    const meta = poseData.metadata || {};
+    const pad = Math.max(10, Math.round(W * 0.02));
+    const fontPx = Math.max(11, Math.round(W / 60));
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    const fitText = (text, maxW) => {
+      if (ctx.measureText(text).width <= maxW) return text;
+      let t = text;
+      while (t.length > 1 && ctx.measureText(t + '…').width > maxW) t = t.slice(0, -1);
+      return t + '…';
+    };
+    // The host component overlays a stats box in the top-right corner.
+    const statsReserve = W > 360 ? 190 : 0;
+    const headerW = W - pad * 2 - statsReserve;
+
+    // Header
+    ctx.fillStyle = '#ffd9a0';
+    ctx.font = `bold ${fontPx + 2}px Arial`;
+    ctx.fillText(fitText('NO POSE MODEL LOADED', headerW), pad, pad);
+    ctx.fillStyle = '#bbbbbb';
+    ctx.font = `${fontPx}px Arial`;
+    ctx.fillText(fitText('Keypoints are not measured. Showing measured CSI quantities.', headerW), pad, pad + fontPx + 8);
+
+    // Fused room state
+    const activity = meta.activity || (sensing && sensing.classification && sensing.classification.motion_level) || 'unknown';
+    const confidence = typeof meta.confidence === 'number' ? meta.confidence
+      : (sensing && sensing.classification ? sensing.classification.confidence : 0);
+    const feat = (sensing && sensing.features) || {};
+    const motionBand = typeof meta.motion_band_power === 'number' ? meta.motion_band_power : feat.motion_band_power;
+    const breathBand = typeof meta.breathing_band_power === 'number' ? meta.breathing_band_power : feat.breathing_band_power;
+    const persons = typeof meta.estimated_persons === 'number' ? meta.estimated_persons
+      : (sensing && sensing.estimated_persons);
+
+    let y = pad + 2 * fontPx + 24;
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `bold ${fontPx + 6}px Arial`;
+    ctx.fillText(`Room: ${String(activity).replace(/_/g, ' ')}`, pad, y);
+    y += fontPx + 14;
+    ctx.fillStyle = '#cccccc';
+    ctx.font = `${fontPx}px Arial`;
+    const fmt = (v, d = 1) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(d) : 'n/a');
+    ctx.fillText(
+      fitText(
+        `confidence ${fmt(confidence, 2)}   motion ${fmt(motionBand)}   breathing ${fmt(breathBand)}   ` +
+        `persons* ${persons == null ? 'n/a' : persons}`,
+        W - pad * 2,
+      ),
+      pad, y,
+    );
+    y += fontPx + 4;
+    ctx.fillStyle = '#888888';
+    ctx.font = `${fontPx - 1}px Arial`;
+    ctx.fillText('* person count is a heuristic from field peaks, not a measurement', pad, y);
+    y += fontPx + 14;
+
+    // Per-node table
+    const nodes = (sensing && Array.isArray(sensing.node_features)) ? [...sensing.node_features] : [];
+    nodes.sort((a, b) => a.node_id - b.node_id);
+    const rowH = fontPx + 10;
+    const labelW = Math.round(W * 0.36);
+    const barW = Math.round(W * 0.26);
+    const valX = pad + labelW + barW + 8;
+    const valW = W - pad - valX;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = `bold ${fontPx}px Arial`;
+    ctx.fillText(nodes.length ? `CSI links (${nodes.length} nodes)` : 'CSI links: none reported', pad, y);
+    ctx.fillStyle = '#888888';
+    ctx.font = `${fontPx - 1}px Arial`;
+    ctx.fillText('motion-band (log)', pad + labelW, y);
+    ctx.fillText(fitText('mbp  RSSI  rate', valW), valX, y);
+    y += fontPx + 8;
+
+    const maxRows = Math.max(1, Math.floor((H - y - pad) / rowH));
+    const shown = nodes.slice(0, maxRows);
+    for (const nf of shown) {
+      const level = (nf.classification && nf.classification.motion_level) || (nf.stale ? 'stale' : 'unknown');
+      const mbp = nf.features ? nf.features.motion_band_power : null;
+      const rssi = nf.rssi_dbm;
+      const fps = nf.frame_rate_hz;
+      // log scale so a 0.3 and a 900 both fit on one bar
+      const frac = (typeof mbp === 'number' && mbp > 0) ? Math.min(1, Math.log10(1 + mbp) / 3) : 0;
+      const color = level === 'present_moving' || level === 'active' ? '#e65125'
+        : level === 'present_still' || level === 'present' ? '#1fb8cd'
+        : level === 'absent' ? '#4caf50' : '#888888';
+
+      ctx.fillStyle = '#dddddd';
+      ctx.font = `${fontPx}px Arial`;
+      ctx.fillText(fitText(`node ${nf.node_id}  ${String(level).replace(/_/g, ' ')}`, labelW - 6), pad, y);
+      ctx.fillStyle = 'rgba(255,255,255,0.08)';
+      ctx.fillRect(pad + labelW, y + 2, barW, rowH - 6);
+      ctx.fillStyle = color;
+      ctx.fillRect(pad + labelW, y + 2, Math.max(2, barW * frac), rowH - 6);
+      ctx.fillStyle = '#aaaaaa';
+      const vals = [
+        fmt(mbp),
+        typeof rssi === 'number' ? `${rssi.toFixed(0)}dBm` : '',
+        typeof fps === 'number' ? `${fps.toFixed(1)}Hz` : '',
+      ].filter(Boolean).join('  ');
+      ctx.fillText(fitText(vals, valW), valX, y);
+      y += rowH;
+    }
+    if (nodes.length > shown.length) {
+      ctx.fillStyle = '#888888';
+      ctx.fillText(`… ${nodes.length - shown.length} more nodes`, pad, y);
+    }
+
+    ctx.textBaseline = 'top';
+    ctx.font = `${this.config.fontSize}px Arial`;
   }
 
   // Render no data message

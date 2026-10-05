@@ -139,6 +139,11 @@ class SensingService {
     return () => this._stateListeners.delete(callback);
   }
 
+  /** Most recent sensing update received (null before the first frame). */
+  get lastMessage() {
+    return this._lastMessage;
+  }
+
   /** Get the RSSI sparkline history (array of floats). */
   getRssiHistory() {
     return [...this._rssiHistory];

@@ -535,7 +535,15 @@ export class PoseService {
         source: 'websocket',
         zone_id: zoneId,
         confidence: zoneData.confidence,
-        activity: zoneData.activity
+        activity: zoneData.activity,
+        // Measured scalars the server attaches to every pose frame; the
+        // renderer shows these directly when no pose model is loaded.
+        server_source: zoneData.metadata?.source,
+        motion_band_power: zoneData.metadata?.motion_band_power,
+        breathing_band_power: zoneData.metadata?.breathing_band_power,
+        signal_strength: zoneData.metadata?.signal_strength,
+        estimated_persons: zoneData.metadata?.estimated_persons,
+        tick: zoneData.metadata?.tick,
       }
     };
     

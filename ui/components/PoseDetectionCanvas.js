@@ -2,6 +2,7 @@
 
 import { PoseRenderer } from '../utils/pose-renderer.js';
 import { poseService } from '../services/pose.service.js';
+import { sensingService } from '../services/sensing.service.js';
 import { SettingsPanel } from './SettingsPanel.js';
 
 export class PoseDetectionCanvas {
@@ -530,7 +531,8 @@ export class PoseDetectionCanvas {
       } else {
         this.renderer.render(poseData, {
           frameCount: this.state.frameCount,
-          connectionState: this.state.connectionState
+          connectionState: this.state.connectionState,
+          sensing: sensingService.lastMessage,
         });
       }
     } catch (error) {
@@ -547,7 +549,8 @@ export class PoseDetectionCanvas {
     try {
       this.renderer.render(poseData, {
         frameCount: this.state.frameCount,
-        connectionState: this.state.connectionState
+        connectionState: this.state.connectionState,
+        sensing: sensingService.lastMessage,
       });
     } finally {
       this.renderer.clearCanvas = origClear;

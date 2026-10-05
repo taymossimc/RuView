@@ -281,9 +281,11 @@ export class LiveDemoTab {
                   </div>
                 </div>
                 <p class="setup-note">
-                  Signal-Derived mode uses aggregate CSI features.
-                  For per-limb tracking, load a trained <code>.rvf</code> model
-                  with <code>--model path.rvf</code> and use 4+ sensors.
+                  Without a trained model only presence, gross motion and
+                  breathing-band power are measured (per link). Per-limb
+                  tracking needs a <code>.rvf</code> model trained on CSI
+                  recorded alongside camera ground truth, loaded with
+                  <code>--model path.rvf</code>.
                 </p>
               </div>
 
@@ -1422,10 +1424,12 @@ export class LiveDemoTab {
         'loaded from an RVF container.';
     } else if (source === 'signal_derived') {
       badge.className = 'pose-source-badge pose-source-signal';
-      badge.textContent = 'Signal-Derived';
+      badge.textContent = 'No pose model';
       description.textContent =
-        'Keypoints are derived from live CSI signal features ' +
-        '(motion power, breathing rate, variance).';
+        'No trained pose model is loaded, so no body keypoints are measured. ' +
+        'The server\u2019s "signal-derived" skeleton is a procedurally animated figure ' +
+        'driven by three scalars (motion power, breathing power, confidence); it is not ' +
+        'drawn here. The canvas shows the measured room state and per-link CSI motion instead.';
     } else {
       badge.className = 'pose-source-badge pose-source-unknown';
       badge.textContent = 'Unknown';
