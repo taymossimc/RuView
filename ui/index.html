@@ -190,78 +190,19 @@
 
         <!-- Hardware Tab -->
         <section id="hardware" class="tab-content" role="tabpanel" aria-labelledby="hardware" aria-hidden="true">
-            <h2>Hardware Configuration</h2>
-            
+            <h2>Hardware</h2>
+            <p class="help-text hw-provenance" id="hw-provenance">Everything on this page is read from the connected sensing-server. Fields the server does not report are shown as "not reported", never filled in.</p>
+
             <div class="hardware-grid">
-                <div class="antenna-section">
-                    <h3>3×3 Antenna Array</h3>
-                    <p class="help-text">Click antennas to toggle their state</p>
-                    <div class="antenna-array">
-                        <div class="antenna-grid">
-                            <div class="antenna tx active" data-type="TX1"></div>
-                            <div class="antenna tx active" data-type="TX2"></div>
-                            <div class="antenna tx active" data-type="TX3"></div>
-                            <div class="antenna rx active" data-type="RX1"></div>
-                            <div class="antenna rx active" data-type="RX2"></div>
-                            <div class="antenna rx active" data-type="RX3"></div>
-                            <div class="antenna rx active" data-type="RX4"></div>
-                            <div class="antenna rx active" data-type="RX5"></div>
-                            <div class="antenna rx active" data-type="RX6"></div>
-                        </div>
-                        <div class="antenna-legend">
-                            <div class="legend-item">
-                                <div class="legend-color tx"></div>
-                                <span>Transmitters (3)</span>
-                            </div>
-                            <div class="legend-item">
-                                <div class="legend-color rx"></div>
-                                <span>Receivers (6)</span>
-                            </div>
-                        </div>
-                        <div class="array-status"></div>
-                    </div>
+                <div class="config-section">
+                    <h3>Capture source</h3>
+                    <div class="config-grid" id="hw-source-grid"></div>
                 </div>
 
                 <div class="config-section">
-                    <h3>WiFi Configuration</h3>
-                    <div class="config-grid">
-                        <div class="config-item">
-                            <label>Frequency</label>
-                            <div class="config-value">2.4GHz ± 20MHz</div>
-                        </div>
-                        <div class="config-item">
-                            <label>Subcarriers</label>
-                            <div class="config-value">30</div>
-                        </div>
-                        <div class="config-item">
-                            <label>Sampling Rate</label>
-                            <div class="config-value">100 Hz</div>
-                        </div>
-                        <div class="config-item">
-                            <label>Total Cost</label>
-                            <div class="config-value">$30</div>
-                        </div>
-                    </div>
-
-                    <div class="csi-data">
-                        <h4>Real-time CSI Data</h4>
-                        <div class="csi-display">
-                            <div class="csi-row">
-                                <span>Amplitude:</span>
-                                <div class="csi-bar">
-                                    <div class="csi-fill amplitude" style="width: 75%"></div>
-                                </div>
-                                <span class="csi-value">0.75</span>
-                            </div>
-                            <div class="csi-row">
-                                <span>Phase:</span>
-                                <div class="csi-bar">
-                                    <div class="csi-fill phase" style="width: 60%"></div>
-                                </div>
-                                <span class="csi-value">1.2π</span>
-                            </div>
-                        </div>
-                    </div>
+                    <h3>CSI nodes</h3>
+                    <p class="help-text">One node per CSI stream the server receives (for the SDR bridge: one transmitter × one receive antenna). Amplitude plots are the latest frame's |H| per subcarrier.</p>
+                    <div class="hw-nodes" id="hw-nodes"></div>
                 </div>
             </div>
         </section>

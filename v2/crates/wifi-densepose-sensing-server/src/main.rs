@@ -501,6 +501,25 @@ struct NodeInfo {
     /// placeholder frames that carry no per-node classification.
     #[serde(skip_serializing_if = "Option::is_none")]
     node_inference: Option<NodeInference>,
+    /// Radio header of the last accepted ADR-018 frame from this node
+    /// (centre frequency, noise floor, PPDU type, antenna count). `None` on
+    /// paths that carry no per-node radio header (wifi scan, simulation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    radio: Option<NodeRadioInfo>,
+    /// `true` when `position` came from `--node-positions`; `false` when it
+    /// is the server's placeholder, so clients do not render a placeholder as
+    /// a measured location.
+    #[serde(default)]
+    position_configured: bool,
+}
+
+/// Per-node radio header, as last reported by the capture hardware.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NodeRadioInfo {
+    freq_mhz: u16,
+    noise_floor_dbm: i8,
+    n_antennas: u8,
+    ppdu_type: String,
 }
 
 /// ADR-110 iter 23 — per-node mesh-sync snapshot embedded in NodeInfo.
@@ -1071,6 +1090,8 @@ struct NodeState {
     field_model_history: VecDeque<Vec<f64>>,
     field_model_latest_sequence: Option<u32>,
     field_model_latest_seen: Option<std::time::Instant>,
+    /// Radio header of the last accepted CSI frame (surfaced in `NodeInfo`).
+    last_radio: Option<NodeRadioInfo>,
 }
 
 /// Default EMA alpha for temporal keypoint smoothing (RuVector Phase 2).
@@ -1444,6 +1465,7 @@ impl NodeState {
             field_model_history: VecDeque::with_capacity(FRAME_HISTORY_CAPACITY),
             field_model_latest_sequence: None,
             field_model_latest_seen: None,
+            last_radio: None,
         }
     }
 
@@ -4478,6 +4500,8 @@ async fn wifi_task(state: SharedState, tick_ms: u64) {
                 subcarrier_count: obs_count,
                 sync: None,  // multi-BSSID scan path — no mesh peer
                 node_inference: None, // single aggregate frame; no per-node split
+                radio: None,
+                position_configured: false,
             }],
             features,
             classification,
@@ -4681,6 +4705,8 @@ async fn single_rssi_fallback_tick(state: &SharedState, seq: u32) {
             subcarrier_count: 1,
             sync: None,  // synthetic-RSSI fallback path — no mesh peer
             node_inference: None, // synthetic fallback; no per-node inference
+            radio: None,
+            position_configured: false,
         }],
         features,
         classification,
@@ -10154,6 +10180,8 @@ async fn udp_receiver_task(
                             sync: n.sync_snapshot(),
                             // ADR-297 — each node carries its own inference.
                             node_inference: Some(node_inference_for(n, now)),
+                            radio: n.last_radio.clone(),
+                            position_configured: resolved_positions.contains_key(&id),
                         })
                         .collect();
 
@@ -10455,6 +10483,15 @@ async fn udp_receiver_task(
                         continue;
                     }
 
+                    if let Some(ns) = s.node_states.get_mut(&frame.node_id) {
+                        ns.last_radio = Some(NodeRadioInfo {
+                            freq_mhz: frame.freq_mhz,
+                            noise_floor_dbm: frame.noise_floor,
+                            n_antennas: frame.n_antennas,
+                            ppdu_type: format!("{:?}", frame.ppdu_type),
+                        });
+                    }
+
                     // Also maintain global frame_history for backward compat
                     // (simulation path, REST endpoints, etc.).
                     s.frame_history.push_back(frame.amplitudes.clone());
@@ -10687,6 +10724,8 @@ async fn udp_receiver_task(
                             sync: n.sync_snapshot(),
                             // ADR-297 — each node carries its own inference.
                             node_inference: Some(node_inference_for(n, now)),
+                            radio: n.last_radio.clone(),
+                            position_configured: resolved_positions.contains_key(&id),
                         })
                         .collect();
 
@@ -10988,6 +11027,8 @@ async fn simulated_data_task(state: SharedState, tick_ms: u64) {
                 subcarrier_count: frame_n_sub as usize,
                 sync: None,  // simulated frame path — no mesh peer
                 node_inference: None, // simulated frame; source is synthetic
+                radio: None,
+                position_configured: false,
             }],
             features: features.clone(),
             classification,
@@ -13011,6 +13052,8 @@ mod node_sync_snapshot_serialization_tests {
             subcarrier_count: 0,
             sync,
             node_inference: None,
+            radio: None,
+            position_configured: false,
         }
     }
 
